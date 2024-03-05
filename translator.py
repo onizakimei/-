@@ -1,13 +1,13 @@
+
 import argparse
 import sys
 import signal
 from datetime import datetime
-
+import opencc
 import ffmpeg
 import numpy as np
 import whisper
 from whisper.audio import SAMPLE_RATE
-
 
 class RingBuffer:
     def __init__(self, size):
@@ -103,8 +103,12 @@ def open_stream(stream, direct_url, preferred_quality):
     thread.start()
     return ffmpeg_process, streamlink_process
 
+def save_subtitles_to_txt(subtitles, output_file):
+    with open(output_file, 'w', encoding='utf-8') as file:
+        for subtitle in subtitles:
+            file.write(subtitle + '\n')
 
-def main(url, model="small", language=None, interval=5, history_buffer_size=0, preferred_quality="audio_only",
+def main(url, model="large-v3", language=None, interval=5, history_buffer_size=0, preferred_quality="audio_only",
          use_vad=True, direct_url=False, faster_whisper_args=None, **decode_options):
 
     n_bytes = interval * SAMPLE_RATE * 2  # Factor 2 comes from reading the int16 stream as bytes
@@ -118,23 +122,29 @@ def main(url, model="small", language=None, interval=5, history_buffer_size=0, p
                              device=faster_whisper_args["device"], 
                              compute_type=faster_whisper_args["compute_type"])
     else:
-        model = whisper.load_model(model)
+        model = whisper.load_model("large-v3")
         
     if use_vad:
         from vad import VAD
         vad = VAD()
 
     print("Opening stream...")
+
     ffmpeg_process, streamlink_process = open_stream(url, direct_url, preferred_quality)
     
     def handler(signum, frame):
         ffmpeg_process.kill()
+        save_subtitles_to_txt(subtitles, '直播字幕.txt')
+        print("字幕已保存，点击左侧的文件夹下载【直播字幕.txt】")
         if streamlink_process:
             streamlink_process.kill()
         sys.exit(0)
         
     signal.signal(signal.SIGINT, handler)
-    
+
+    converter = opencc.OpenCC('/usr/local/lib/python3.10/dist-packages/opencc/config/t2s')
+    subtitles = []
+
     try:
         while ffmpeg_process.poll() is None:
             # Read audio from ffmpeg stream
@@ -144,7 +154,6 @@ def main(url, model="small", language=None, interval=5, history_buffer_size=0, p
 
             audio = np.frombuffer(in_bytes, np.int16).flatten().astype(np.float32) / 32768.0
             if use_vad and vad.no_speech(audio):
-                print(f'{datetime.now().strftime("%H:%M:%S")}')
                 continue
             audio_buffer.append(audio)
 
@@ -183,36 +192,44 @@ def main(url, model="small", language=None, interval=5, history_buffer_size=0, p
                         # repetition and getting stuck.
                         clear_buffers = True
 
+            new_prefix = converter.convert(new_prefix)
+            decoded_text = converter.convert(decoded_text)
+            
+            subtitles.append(decoded_text)
+            
             previous_text.append(new_prefix)
 
             if clear_buffers or previous_text.has_repetition():
                 audio_buffer.clear()
                 previous_text.clear()
                 
-            print(f'{datetime.now().strftime("%H:%M:%S")} {decoded_language} {decoded_text}')
+            print(f'{decoded_language} {decoded_text}')
 
         print("Stream ended")
+
+
     finally:
         ffmpeg_process.kill()
         if streamlink_process:
             streamlink_process.kill()
-
+    save_subtitles_to_txt(subtitles, '直播字幕.txt')
+    print("字幕已保存，点击左侧的文件夹下载【直播字幕.txt】")
 
 def cli():
     parser = argparse.ArgumentParser(description="Parameters for translator.py")
     parser.add_argument('URL', type=str, help='Stream website and channel name, e.g. twitch.tv/forsen')
     parser.add_argument('--model', type=str,
-                        choices=['tiny', 'tiny.en', 'small', 'small.en', 'medium', 'medium.en', 'large'],
-                        default='small',
+                        choices=['tiny', 'tiny.en', 'small', 'small.en', 'medium', 'medium.en', 'large', 'large-v3'],
+                        default='large-v3',
                         help='Model to be used for generating audio transcription. Smaller models are faster and use '
                              'less VRAM, but are also less accurate. .en models are more accurate but only work on '
                              'English audio.')
-    parser.add_argument('--task', type=str, choices=['transcribe', 'translate'], default='translate',
+    parser.add_argument('--task', type=str, choices=['transcribe', 'translate'], default='transcribe',
                         help='Whether to transcribe the audio (keep original language) or translate to English.')
-    parser.add_argument('--language', type=str, default='auto',
+    parser.add_argument('--language', type=str, default='Chinese',
                         help='Language spoken in the stream. Default option is to auto detect the spoken language. '
                              'See https://github.com/openai/whisper for available languages.')
-    parser.add_argument('--interval', type=int, default=5,
+    parser.add_argument('--interval', type=int, default=2,
                         help='Interval between calls to the language model in seconds.')
     parser.add_argument('--history_buffer_size', type=int, default=0,
                         help='Seconds of previous audio/text to use for conditioning the model. Set to 0 to just use '
@@ -222,7 +239,7 @@ def cli():
                         help='Number of beams in beam search. Set to 0 to use greedy algorithm instead.')
     parser.add_argument('--best_of', type=int, default=5,
                         help='Number of candidates when sampling with non-zero temperature.')
-    parser.add_argument('--preferred_quality', type=str, default='audio_only',
+    parser.add_argument('--preferred_quality', type=str, default='best',
                         help='Preferred stream quality option. "best" and "worst" should always be available. Type '
                              '"streamlink URL" in the console to see quality options for your URL.')
     parser.add_argument('--disable_vad', action='store_true',
@@ -233,7 +250,7 @@ def cli():
     parser.add_argument('--use_faster_whisper', action='store_true',
                         help='Set this flag to use faster-whisper implementation instead of the original OpenAI '
                              'implementation.')
-    parser.add_argument('--faster_whisper_model_path', type=str, default='whisper-large-v2-ct2/',
+    parser.add_argument('--faster_whisper_model_path', type=str, default='whisper-large-v3-ct2/',
                         help='Path to a directory containing a Whisper model in the CTranslate2 format.')
     parser.add_argument('--faster_whisper_device', type=str, choices=['cuda', 'cpu', 'auto'], default='cuda',
                         help='Set the device to run faster-whisper on.')
@@ -274,3 +291,4 @@ def cli():
 
 if __name__ == '__main__':
     cli()
+    disconnect_runtime()
